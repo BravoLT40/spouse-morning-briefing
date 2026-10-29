@@ -1,0 +1,13 @@
+{
+  "recipient_email": "user@example.com",
+  "subject_line": "Shit My Spouse Told Me",
+  "spouse_name": "Spouse Name",
+  "spouse_emails": [
+    "spouse.work@example.com",
+    "spouse.personal@gmail.com"
+  ],
+  "spouse_phone": "5551234567",
+  "briefing_hour": 6,
+  "briefing_minute": 15,
+  "server_port": 8765
+}

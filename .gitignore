@@ -1,0 +1,17 @@
+# User configuration & private data
+config.json
+tasks_queue.json
+
+# Logs
+*.log
+briefing.log
+briefing_err.log
+server.log
+server_err.log
+
+# System & Python artifacts
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+.env
