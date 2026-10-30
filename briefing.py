@@ -669,7 +669,7 @@ def run_briefing(send_email=True, hours=24):
 # --- Server ---
 
 def run_server():
-    from http.server import HTTPServer, BaseHTTPRequestHandler
+    from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
     import ipaddress
     config = load_config()
     port = config.get("server_port", 8765)
@@ -688,6 +688,29 @@ def run_server():
             return False
 
     class TaskHandler(BaseHTTPRequestHandler):
+        def _send_html(self, status_code, html_content):
+            body = html_content.encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';")
+            self.end_headers()
+            self.wfile.write(body)
+            self.close_connection = True
+
+        def _send_text(self, status_code, text):
+            body = text.encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+            self.close_connection = True
+
         def do_GET(self):
             # CSRF & Host validation: Reject cross-origin requests from public websites
             host = self.headers.get("Host", "")
@@ -695,15 +718,11 @@ def run_server():
             if origin:
                 origin_host = urllib.parse.urlparse(origin).netloc
                 if not is_trusted_host(origin_host):
-                    self.send_response(403)
-                    self.end_headers()
-                    self.wfile.write(b"Forbidden: untrusted origin.")
+                    self._send_text(403, "Forbidden: untrusted origin.")
                     return
 
             if not is_trusted_host(host):
-                self.send_response(400)
-                self.end_headers()
-                self.wfile.write(b"Bad Request: invalid host header.")
+                self._send_text(400, "Bad Request: invalid host header.")
                 return
 
             parsed = urllib.parse.urlparse(self.path)
@@ -714,9 +733,7 @@ def run_server():
                 # Input validation: cap length and strip control characters
                 clean_task = "".join(ch for ch in raw_task[:300] if ch.isprintable() or ch in " \t\n").strip()
                 if not clean_task:
-                    self.send_response(400)
-                    self.end_headers()
-                    self.wfile.write(b"Bad Request: missing or invalid task parameter.")
+                    self._send_text(400, "Bad Request: missing or invalid task parameter.")
                     return
 
                 prompt = f"Please help me complete this task from {spouse_name}: {clean_task}"
@@ -766,13 +783,6 @@ def run_server():
                 escaped_task = html.escape(clean_task)
                 escaped_prompt = html.escape(prompt)
 
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("X-Content-Type-Options", "nosniff")
-                self.send_header("X-Frame-Options", "DENY")
-                self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';")
-                self.end_headers()
-
                 resp_html = f"""
                 <!DOCTYPE html>
                 <html>
@@ -810,7 +820,7 @@ def run_server():
                 </body>
                 </html>
                 """
-                self.wfile.write(resp_html.encode("utf-8"))
+                self._send_html(200, resp_html)
 
             elif parsed.path == "/done":
                 params = urllib.parse.parse_qs(parsed.query)
@@ -825,9 +835,7 @@ def run_server():
                         break
 
                 if not target_task:
-                    self.send_response(404)
-                    self.end_headers()
-                    self.wfile.write(b"Task not found.")
+                    self._send_text(404, "Task not found.")
                     return
 
                 save_stored_tasks(tasks)
@@ -844,13 +852,6 @@ def run_server():
 
                 esc_title = html.escape(target_task['title'])
                 undo_url = f"/undo?id={urllib.parse.quote(task_id)}"
-
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("X-Content-Type-Options", "nosniff")
-                self.send_header("X-Frame-Options", "DENY")
-                self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline';")
-                self.end_headers()
 
                 resp_html = f"""
                 <!DOCTYPE html>
@@ -876,7 +877,7 @@ def run_server():
                 </body>
                 </html>
                 """
-                self.wfile.write(resp_html.encode("utf-8"))
+                self._send_html(200, resp_html)
 
             elif parsed.path == "/undo":
                 params = urllib.parse.parse_qs(parsed.query)
@@ -891,22 +892,13 @@ def run_server():
                         break
 
                 if not target_task:
-                    self.send_response(404)
-                    self.end_headers()
-                    self.wfile.write(b"Task not found.")
+                    self._send_text(404, "Task not found.")
                     return
 
                 save_stored_tasks(tasks)
 
                 esc_title = html.escape(target_task['title'])
                 done_url = f"/done?id={urllib.parse.quote(task_id)}"
-
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("X-Content-Type-Options", "nosniff")
-                self.send_header("X-Frame-Options", "DENY")
-                self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline';")
-                self.end_headers()
 
                 resp_html = f"""
                 <!DOCTYPE html>
@@ -932,10 +924,16 @@ def run_server():
                 </body>
                 </html>
                 """
-                self.wfile.write(resp_html.encode("utf-8"))
+                self._send_html(200, resp_html)
             else:
-                self.send_response(404)
-                self.end_headers()
+                self._send_text(404, "Not Found")
+
+    server = ThreadingHTTPServer(("0.0.0.0", port), TaskHandler)
+    print(f"Action trigger server running at http://0.0.0.0:{port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
 
     server = HTTPServer(("0.0.0.0", port), TaskHandler)
     print(f"Action trigger server running at http://0.0.0.0:{port}")
