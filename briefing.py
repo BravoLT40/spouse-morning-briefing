@@ -15,6 +15,7 @@ import sys
 import json
 import re
 import html
+import hashlib
 import sqlite3
 import base64
 import urllib.request
@@ -25,6 +26,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 CONFIG_PATH = os.path.expanduser(os.environ.get("SPOUSE_BRIEFING_CONFIG", os.path.join(os.path.dirname(__file__), "config.json")))
+ACTIVE_TASKS_FILE = os.path.join(os.path.dirname(__file__), "active_tasks.json")
 
 def load_config():
     if not os.path.exists(CONFIG_PATH):
@@ -32,6 +34,61 @@ def load_config():
         raise FileNotFoundError(f"Configuration file not found at '{CONFIG_PATH}'. Copy '{sample}' to 'config.json' and fill in your details, or run with /interview-me.")
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
+
+# --- Persistent Task Store Helpers ---
+
+def generate_task_id(title):
+    """Generates a stable 10-character hash ID from a normalized task title."""
+    norm = re.sub(r"[^a-z0-9]", "", title.lower())
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:10]
+
+def load_stored_tasks(path=ACTIVE_TASKS_FILE):
+    """Loads persistent tasks from disk."""
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+def save_stored_tasks(tasks, path=ACTIVE_TASKS_FILE):
+    """Atomically saves tasks to disk with restrictive 0o600 permissions."""
+    temp_path = f"{path}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(temp_path, flags, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(tasks, f, indent=2)
+    os.replace(temp_path, path)
+
+def update_task_store(new_scanned_tasks, path=ACTIVE_TASKS_FILE):
+    """Merges newly detected tasks into the persistent task store without resurrecting completed tasks."""
+    stored = load_stored_tasks(path)
+    stored_by_id = {t["id"]: t for t in stored}
+
+    for t in new_scanned_tasks:
+        tid = generate_task_id(t["title"])
+        if tid in stored_by_id:
+            existing = stored_by_id[tid]
+            if existing.get("status") == "open":
+                existing["schedule"] = t["schedule"]
+                existing["details"] = t["details"]
+        else:
+            stored.append({
+                "id": tid,
+                "type": t["type"],
+                "title": t["title"],
+                "details": t["details"],
+                "schedule": t["schedule"],
+                "is_agent": t["is_agent"],
+                "channel": t["channel"],
+                "status": "open",
+                "first_seen": datetime.now().isoformat(),
+                "completed_at": None
+            })
+
+    save_stored_tasks(stored, path)
+    return stored
 
 # --- Authentication Helpers ---
 
@@ -368,10 +425,20 @@ def build_action_url(task_title, server_port):
     host = get_local_ip()
     return f"http://{host}:{server_port}/start?task={param}"
 
-def generate_email_html(tasks, config, imsg_err=None):
-    go_here = [t for t in tasks if t['type'] == 'GO_HERE']
-    do_that = [t for t in tasks if t['type'] == 'DO_THAT']
-    remember_this = [t for t in tasks if t['type'] == 'REMEMBER_THIS']
+def build_done_url(task_id, server_port):
+    param = urllib.parse.quote(task_id)
+    host = get_local_ip()
+    return f"http://{host}:{server_port}/done?id={param}"
+
+def build_undo_url(task_id, server_port):
+    param = urllib.parse.quote(task_id)
+    host = get_local_ip()
+    return f"http://{host}:{server_port}/undo?id={param}"
+
+def generate_email_html(open_tasks, config, recently_completed=None, imsg_err=None):
+    go_here = [t for t in open_tasks if t['type'] == 'GO_HERE']
+    do_that = [t for t in open_tasks if t['type'] == 'DO_THAT']
+    remember_this = [t for t in open_tasks if t['type'] == 'REMEMBER_THIS']
     server_port = config.get("server_port", 8765)
 
     html_content = f"""
@@ -397,6 +464,7 @@ def generate_email_html(tasks, config, imsg_err=None):
         .task-quote {{ font-size: 12px; color: #64748b; margin-top: 6px; font-style: italic; }}
         .task-meta {{ font-size: 11px; color: #94a3b8; margin-top: 6px; }}
         .btn {{ display: inline-block; margin-top: 10px; padding: 7px 14px; background: #16a34a; color: #ffffff !important; text-decoration: none; border-radius: 6px; font-size: 12px; font-weight: 600; }}
+        .btn-done {{ background: #0284c7 !important; margin-left: 6px; }}
         .empty {{ font-size: 13px; color: #94a3b8; margin: 0; }}
         .footer {{ padding: 16px 28px; font-size: 11px; color: #94a3b8; text-align: center; }}
       </style>
@@ -423,15 +491,17 @@ def generate_email_html(tasks, config, imsg_err=None):
             esc_title = html.escape(t['title'])
             esc_sched = html.escape(t['schedule'])
             esc_chan = html.escape(t['channel'].upper())
+            done_btn = f'<a href="{build_done_url(t["id"], server_port)}" class="btn btn-done">✓ Mark Done</a>'
             html_content += f"""
             <div class="task-card">
               <div class="task-title">{esc_title}</div>
               <div class="task-schedule">📅 <strong>{esc_sched}</strong></div>
               <div class="task-meta">{esc_chan}</div>
+              <div style="margin-top: 8px;">{done_btn}</div>
             </div>
             """
     else:
-        html_content += '<p class="empty">No locations or scheduled games/practices today.</p>'
+        html_content += '<p class="empty">No locations or scheduled games/practices on your active list.</p>'
     html_content += '</div>'
 
     # 2. DO THAT
@@ -443,18 +513,22 @@ def generate_email_html(tasks, config, imsg_err=None):
             esc_quote = html.escape(t['details'])
             esc_chan = html.escape(t['channel'].upper())
             agent_class = " agent" if t['is_agent'] else ""
-            action_btn = f'<a href="{build_action_url(t["title"], server_port)}" class="btn">👉 Start this task with AI</a>' if t['is_agent'] else ""
+            action_btn = f'<a href="{build_action_url(t["title"], server_port)}" class="btn">👉 Start with AI</a>' if t['is_agent'] else ""
+            done_btn = f'<a href="{build_done_url(t["id"], server_port)}" class="btn btn-done">✓ Mark Done</a>'
             html_content += f"""
             <div class="task-card{agent_class}">
               <div class="task-title">{esc_title}</div>
               <div class="task-schedule">📅 <strong>{esc_sched}</strong></div>
               <div class="task-quote">"{esc_quote}"</div>
               <div class="task-meta">{esc_chan}</div>
-              {action_btn}
+              <div style="margin-top: 8px;">
+                {action_btn}
+                {done_btn}
+              </div>
             </div>
             """
     else:
-        html_content += '<p class="empty">No direct action items found.</p>'
+        html_content += '<p class="empty">No pending action items found. You are all caught up!</p>'
     html_content += '</div>'
 
     # 3. REMEMBER THIS
@@ -466,23 +540,40 @@ def generate_email_html(tasks, config, imsg_err=None):
             esc_quote = html.escape(t['details'])
             esc_chan = html.escape(t['channel'].upper())
             agent_class = " agent" if t['is_agent'] else ""
-            action_btn = f'<a href="{build_action_url(t["title"], server_port)}" class="btn">👉 Start this task with AI</a>' if t['is_agent'] else ""
+            action_btn = f'<a href="{build_action_url(t["title"], server_port)}" class="btn">👉 Start with AI</a>' if t['is_agent'] else ""
+            done_btn = f'<a href="{build_done_url(t["id"], server_port)}" class="btn btn-done">✓ Mark Done</a>'
             html_content += f"""
             <div class="task-card{agent_class}">
               <div class="task-title">{esc_title}</div>
               <div class="task-schedule">📅 <strong>{esc_sched}</strong></div>
               <div class="task-quote">"{esc_quote}"</div>
               <div class="task-meta">{esc_chan}</div>
-              {action_btn}
+              <div style="margin-top: 8px;">
+                {action_btn}
+                {done_btn}
+              </div>
             </div>
             """
     else:
-        html_content += '<p class="empty">No reminders for today.</p>'
+        html_content += '<p class="empty">No active reminders on your list.</p>'
     html_content += '</div>'
+
+    # 4. RECENTLY COMPLETED
+    if recently_completed:
+        html_content += '<div class="section" style="background: #f8fafc; border-top: 2px dashed #e2e8f0;"><div class="section-title" style="color: #64748b;">✅ Recently Completed (Last 24 Hours)</div>'
+        for t in recently_completed:
+            esc_title = html.escape(t['title'])
+            undo_link = f'<a href="{build_undo_url(t["id"], server_port)}" style="font-size: 11px; margin-left: 8px; color: #2563eb; text-decoration: none;">(Undo)</a>'
+            html_content += f"""
+            <div style="margin-bottom: 8px; font-size: 13px; color: #64748b;">
+              <span style="text-decoration: line-through;">{esc_title}</span> {undo_link}
+            </div>
+            """
+        html_content += '</div>'
 
     html_content += f"""
         <div class="footer">
-          Generated automatically • Only tasks and directives are captured. Banter filtered out.
+          Generated automatically • Running task list stays active until marked done. Banter filtered out.
         </div>
       </div>
     </body>
@@ -546,9 +637,24 @@ def run_briefing(send_email=True, hours=24):
                     "date": item["date"]
                 })
 
-    print(f"Extracted {len(tasks)} distinct tasks with day/date/time.")
+    print(f"Extracted {len(tasks)} distinct tasks from communications in past {hours} hours.")
 
-    html = generate_email_html(tasks, config, imsg_err)
+    # Update persistent running task store
+    all_stored_tasks = update_task_store(tasks)
+
+    # Active open tasks to display
+    open_tasks = [t for t in all_stored_tasks if t.get("status") == "open"]
+
+    # Tasks completed within the last 24 hours
+    cutoff_24h = (datetime.now() - timedelta(hours=24)).isoformat()
+    recently_completed = [
+        t for t in all_stored_tasks
+        if t.get("status") == "completed" and t.get("completed_at") and t.get("completed_at") >= cutoff_24h
+    ]
+
+    print(f"Active Running List: {len(open_tasks)} open tasks, {len(recently_completed)} recently completed.")
+
+    html = generate_email_html(open_tasks, config, recently_completed, imsg_err)
     
     if send_email:
         print(f"Sending task-focused briefing to {config['recipient_email']}...")
@@ -701,6 +807,128 @@ def run_server():
                       window.location.href = "antigravity://";
                     }}, 400);
                   </script>
+                </body>
+                </html>
+                """
+                self.wfile.write(resp_html.encode("utf-8"))
+
+            elif parsed.path == "/done":
+                params = urllib.parse.parse_qs(parsed.query)
+                task_id = params.get("id", [""])[0].strip()
+                tasks = load_stored_tasks()
+                target_task = None
+                for t in tasks:
+                    if t.get("id") == task_id:
+                        t["status"] = "completed"
+                        t["completed_at"] = datetime.now().isoformat()
+                        target_task = t
+                        break
+
+                if not target_task:
+                    self.send_response(404)
+                    self.end_headers()
+                    self.wfile.write(b"Task not found.")
+                    return
+
+                save_stored_tasks(tasks)
+
+                try:
+                    notify_script = """
+                    on run argv
+                        display notification (item 1 of argv) with title (item 2 of argv)
+                    end run
+                    """
+                    subprocess.run(["osascript", "-e", notify_script, f"Completed: {target_task['title']}", "Task Marked Done"], check=False)
+                except Exception:
+                    pass
+
+                esc_title = html.escape(target_task['title'])
+                undo_url = f"/undo?id={urllib.parse.quote(task_id)}"
+
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("X-Frame-Options", "DENY")
+                self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline';")
+                self.end_headers()
+
+                resp_html = f"""
+                <!DOCTYPE html>
+                <html>
+                <head>
+                  <title>Task Completed</title>
+                  <meta name="viewport" content="width=device-width, initial-scale=1">
+                  <style>
+                    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; padding: 40px 20px; text-align: center; background: #f8fafc; color: #1e293b; }}
+                    .box {{ max-width: 520px; margin: 0 auto; background: #ffffff; border-radius: 12px; padding: 32px; border: 1px solid #e2e8f0; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); }}
+                    h1 {{ font-size: 22px; color: #0284c7; margin-top: 0; }}
+                    .task-name {{ font-size: 16px; font-weight: 600; color: #0f172a; margin: 16px 0; background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; padding: 12px; }}
+                    .btn {{ display: inline-block; padding: 10px 20px; background: #475569; color: #ffffff !important; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 13px; margin-top: 14px; }}
+                  </style>
+                </head>
+                <body>
+                  <div class="box">
+                    <h1>✅ Task Marked Complete!</h1>
+                    <div class="task-name">"{esc_title}"</div>
+                    <p style="font-size: 14px; color: #64748b;">This task has been checked off and will no longer appear on your active morning briefing.</p>
+                    <a href="{undo_url}" class="btn">↩️ Click to Undo</a>
+                  </div>
+                </body>
+                </html>
+                """
+                self.wfile.write(resp_html.encode("utf-8"))
+
+            elif parsed.path == "/undo":
+                params = urllib.parse.parse_qs(parsed.query)
+                task_id = params.get("id", [""])[0].strip()
+                tasks = load_stored_tasks()
+                target_task = None
+                for t in tasks:
+                    if t.get("id") == task_id:
+                        t["status"] = "open"
+                        t["completed_at"] = None
+                        target_task = t
+                        break
+
+                if not target_task:
+                    self.send_response(404)
+                    self.end_headers()
+                    self.wfile.write(b"Task not found.")
+                    return
+
+                save_stored_tasks(tasks)
+
+                esc_title = html.escape(target_task['title'])
+                done_url = f"/done?id={urllib.parse.quote(task_id)}"
+
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("X-Frame-Options", "DENY")
+                self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline';")
+                self.end_headers()
+
+                resp_html = f"""
+                <!DOCTYPE html>
+                <html>
+                <head>
+                  <title>Task Reopened</title>
+                  <meta name="viewport" content="width=device-width, initial-scale=1">
+                  <style>
+                    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; padding: 40px 20px; text-align: center; background: #f8fafc; color: #1e293b; }}
+                    .box {{ max-width: 520px; margin: 0 auto; background: #ffffff; border-radius: 12px; padding: 32px; border: 1px solid #e2e8f0; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); }}
+                    h1 {{ font-size: 22px; color: #d97706; margin-top: 0; }}
+                    .task-name {{ font-size: 16px; font-weight: 600; color: #0f172a; margin: 16px 0; background: #fffbeb; border: 1px solid #fde68a; border-radius: 8px; padding: 12px; }}
+                    .btn {{ display: inline-block; padding: 10px 20px; background: #0284c7; color: #ffffff !important; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 13px; margin-top: 14px; }}
+                  </style>
+                </head>
+                <body>
+                  <div class="box">
+                    <h1>🔄 Task Restored to Active List</h1>
+                    <div class="task-name">"{esc_title}"</div>
+                    <p style="font-size: 14px; color: #64748b;">This task will appear again in your tomorrow morning briefing until completed.</p>
+                    <a href="{done_url}" class="btn">✓ Mark Done Again</a>
+                  </div>
                 </body>
                 </html>
                 """

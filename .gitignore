@@ -1,6 +1,8 @@
 # User configuration & private data
 config.json
 tasks_queue.json
+active_tasks.json
+*.tmp
 
 # Logs
 *.log
