@@ -349,9 +349,22 @@ def extract_task(item):
 
 # --- Email Composer & Sender ---
 
+def get_local_ip():
+    """Returns local LAN IP so action links can be clicked from a phone on the same Wi-Fi."""
+    try:
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
 def build_action_url(task_title, server_port):
     param = urllib.parse.quote(task_title)
-    return f"http://127.0.0.1:{server_port}/start?task={param}"
+    host = get_local_ip()
+    return f"http://{host}:{server_port}/start?task={param}"
 
 def generate_email_html(tasks, config, imsg_err=None):
     go_here = [t for t in tasks if t['type'] == 'GO_HERE']
@@ -531,8 +544,10 @@ def run_briefing(send_email=True, hours=24):
 
 def run_server():
     from http.server import HTTPServer, BaseHTTPRequestHandler
+    import subprocess
     config = load_config()
     port = config.get("server_port", 8765)
+    spouse_name = config.get("spouse_name", "Spouse")
 
     class TaskHandler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -540,10 +555,26 @@ def run_server():
             if parsed.path == "/start":
                 params = urllib.parse.parse_qs(parsed.query)
                 task = params.get("task", ["Unknown Task"])[0]
-                
-                clean_task = task.replace('"', '\\"')
-                os.system(f'osascript -e \'display notification "{clean_task}" with title "Briefing Task Started"\'')
+                prompt = f"Please help me complete this task from {spouse_name}: {task}"
 
+                # 1. Put prompt into macOS clipboard
+                try:
+                    p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+                    p.communicate(prompt.encode("utf-8"))
+                except Exception as e:
+                    print(f"Error copying to clipboard: {e}", file=sys.stderr)
+
+                # 2. Activate Antigravity application window
+                try:
+                    subprocess.run(["osascript", "-e", 'tell application "Antigravity" to activate'])
+                except Exception as e:
+                    print(f"Error activating Antigravity: {e}", file=sys.stderr)
+
+                # 3. Deliver desktop notification
+                clean_task = task.replace('"', '\\"')
+                os.system(f'osascript -e \'display notification "{clean_task}" with title "Antigravity Activated" subtitle "Prompt copied to clipboard"\'')
+
+                # 4. Save to task queue
                 queue_path = os.path.join(os.path.dirname(__file__), "tasks_queue.json")
                 queue = []
                 if os.path.exists(queue_path):
@@ -562,11 +593,37 @@ def run_server():
                 resp_html = f"""
                 <!DOCTYPE html>
                 <html>
-                <head><title>Task Started</title><meta name="viewport" content="width=device-width, initial-scale=1"></head>
-                <body style="font-family: -apple-system, sans-serif; padding: 40px; text-align: center; background: #f0fdf4;">
-                  <h1 style="color: #166534;">🚀 Agent Task Initiated!</h1>
-                  <p style="font-size: 16px; color: #1e293b;"><strong>Task:</strong> {task}</p>
-                  <p style="color: #64748b;">Logged to queue and notification delivered to your Mac.</p>
+                <head>
+                  <title>Starting Antigravity Task</title>
+                  <meta name="viewport" content="width=device-width, initial-scale=1">
+                  <style>
+                    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; padding: 40px 20px; text-align: center; background: #f8fafc; color: #1e293b; }}
+                    .box {{ max-width: 540px; margin: 0 auto; background: #ffffff; border-radius: 12px; padding: 32px; border: 1px solid #e2e8f0; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); }}
+                    h1 {{ font-size: 22px; color: #15803d; margin-top: 0; }}
+                    .prompt-box {{ background: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 8px; padding: 14px; text-align: left; font-size: 14px; margin: 20px 0; font-family: monospace; color: #0f172a; word-break: break-word; }}
+                    .btn {{ display: inline-block; padding: 12px 24px; background: #2563eb; color: #ffffff !important; text-decoration: none; border-radius: 8px; font-weight: 600; font-size: 15px; margin: 8px 4px; cursor: pointer; border: none; }}
+                    .btn-copy {{ background: #475569; }}
+                    .instructions {{ font-size: 14px; color: #64748b; line-height: 1.5; margin-top: 20px; }}
+                  </style>
+                </head>
+                <body>
+                  <div class="box">
+                    <h1>🚀 Antigravity Activated!</h1>
+                    <p style="font-size: 15px;">Your task has been loaded and Antigravity is now open in the foreground.</p>
+                    <div class="prompt-box" id="pbox">{prompt}</div>
+                    <div>
+                      <a href="antigravity://" class="btn">⚡ Switch to Antigravity</a>
+                      <button onclick="navigator.clipboard.writeText(document.getElementById('pbox').innerText); alert('Copied!');" class="btn btn-copy">📋 Copy Prompt</button>
+                    </div>
+                    <div class="instructions">
+                      <strong>Next step:</strong> Switch to the Antigravity chat window, press <strong>⌘V</strong> to paste the prompt, and press <strong>Enter</strong> to start!
+                    </div>
+                  </div>
+                  <script>
+                    setTimeout(() => {{
+                      window.location.href = "antigravity://";
+                    }}, 400);
+                  </script>
                 </body>
                 </html>
                 """
@@ -575,8 +632,8 @@ def run_server():
                 self.send_response(404)
                 self.end_headers()
 
-    server = HTTPServer(("127.0.0.1", port), TaskHandler)
-    print(f"Action trigger server running at http://127.0.0.1:{port}")
+    server = HTTPServer(("0.0.0.0", port), TaskHandler)
+    print(f"Action trigger server running at http://0.0.0.0:{port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
