@@ -409,6 +409,13 @@ def generate_email_html(tasks, config, imsg_err=None):
         </div>
     """
 
+    if imsg_err:
+        html_content += f"""
+        <div style="background: #fff8e1; color: #b78103; padding: 12px 24px; font-size: 12px; border-bottom: 1px solid #fbe29d;">
+          <strong>Notice regarding iMessage:</strong> {html.escape(imsg_err)}
+        </div>
+        """
+
     # 1. GO HERE
     html_content += '<div class="section"><div class="section-title title-go">📍 GO HERE (Places, Games & Practices)</div>'
     if go_here:
