@@ -14,10 +14,12 @@ import os
 import sys
 import json
 import re
+import html
 import sqlite3
 import base64
 import urllib.request
 import urllib.parse
+import subprocess
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -372,7 +374,7 @@ def generate_email_html(tasks, config, imsg_err=None):
     remember_this = [t for t in tasks if t['type'] == 'REMEMBER_THIS']
     server_port = config.get("server_port", 8765)
 
-    html = f"""
+    html_content = f"""
     <!DOCTYPE html>
     <html>
     <head>
@@ -402,65 +404,76 @@ def generate_email_html(tasks, config, imsg_err=None):
     <body>
       <div class="card">
         <div class="header">
-          <h1>{config.get("subject_line", "Morning Briefing")}</h1>
+          <h1>{html.escape(config.get("subject_line", "Morning Briefing"))}</h1>
           <p>Daily Action Briefing • {datetime.now().strftime('%A, %B %d, %Y')}</p>
         </div>
     """
 
     # 1. GO HERE
-    html += '<div class="section"><div class="section-title title-go">📍 GO HERE (Places, Games & Practices)</div>'
+    html_content += '<div class="section"><div class="section-title title-go">📍 GO HERE (Places, Games & Practices)</div>'
     if go_here:
         for t in go_here:
-            html += f"""
+            esc_title = html.escape(t['title'])
+            esc_sched = html.escape(t['schedule'])
+            esc_chan = html.escape(t['channel'].upper())
+            html_content += f"""
             <div class="task-card">
-              <div class="task-title">{t['title']}</div>
-              <div class="task-schedule">📅 <strong>{t['schedule']}</strong></div>
-              <div class="task-meta">{t['channel'].upper()}</div>
+              <div class="task-title">{esc_title}</div>
+              <div class="task-schedule">📅 <strong>{esc_sched}</strong></div>
+              <div class="task-meta">{esc_chan}</div>
             </div>
             """
     else:
-        html += '<p class="empty">No locations or scheduled games/practices today.</p>'
-    html += '</div>'
+        html_content += '<p class="empty">No locations or scheduled games/practices today.</p>'
+    html_content += '</div>'
 
     # 2. DO THAT
-    html += '<div class="section"><div class="section-title title-do">⚡ DO THAT (Action Items & Chores)</div>'
+    html_content += '<div class="section"><div class="section-title title-do">⚡ DO THAT (Action Items & Chores)</div>'
     if do_that:
         for t in do_that:
+            esc_title = html.escape(t['title'])
+            esc_sched = html.escape(t['schedule'])
+            esc_quote = html.escape(t['details'])
+            esc_chan = html.escape(t['channel'].upper())
             agent_class = " agent" if t['is_agent'] else ""
             action_btn = f'<a href="{build_action_url(t["title"], server_port)}" class="btn">👉 Start this task with AI</a>' if t['is_agent'] else ""
-            html += f"""
+            html_content += f"""
             <div class="task-card{agent_class}">
-              <div class="task-title">{t['title']}</div>
-              <div class="task-schedule">📅 <strong>{t['schedule']}</strong></div>
-              <div class="task-quote">"{t['details']}"</div>
-              <div class="task-meta">{t['channel'].upper()}</div>
+              <div class="task-title">{esc_title}</div>
+              <div class="task-schedule">📅 <strong>{esc_sched}</strong></div>
+              <div class="task-quote">"{esc_quote}"</div>
+              <div class="task-meta">{esc_chan}</div>
               {action_btn}
             </div>
             """
     else:
-        html += '<p class="empty">No direct action items found.</p>'
-    html += '</div>'
+        html_content += '<p class="empty">No direct action items found.</p>'
+    html_content += '</div>'
 
     # 3. REMEMBER THIS
-    html += '<div class="section"><div class="section-title title-rem">🧠 REMEMBER THIS (Reminders & Deadlines)</div>'
+    html_content += '<div class="section"><div class="section-title title-rem">🧠 REMEMBER THIS (Reminders & Deadlines)</div>'
     if remember_this:
         for t in remember_this:
+            esc_title = html.escape(t['title'])
+            esc_sched = html.escape(t['schedule'])
+            esc_quote = html.escape(t['details'])
+            esc_chan = html.escape(t['channel'].upper())
             agent_class = " agent" if t['is_agent'] else ""
             action_btn = f'<a href="{build_action_url(t["title"], server_port)}" class="btn">👉 Start this task with AI</a>' if t['is_agent'] else ""
-            html += f"""
+            html_content += f"""
             <div class="task-card{agent_class}">
-              <div class="task-title">{t['title']}</div>
-              <div class="task-schedule">📅 <strong>{t['schedule']}</strong></div>
-              <div class="task-quote">"{t['details']}"</div>
-              <div class="task-meta">{t['channel'].upper()}</div>
+              <div class="task-title">{esc_title}</div>
+              <div class="task-schedule">📅 <strong>{esc_sched}</strong></div>
+              <div class="task-quote">"{esc_quote}"</div>
+              <div class="task-meta">{esc_chan}</div>
               {action_btn}
             </div>
             """
     else:
-        html += '<p class="empty">No reminders for today.</p>'
-    html += '</div>'
+        html_content += '<p class="empty">No reminders for today.</p>'
+    html_content += '</div>'
 
-    html += f"""
+    html_content += f"""
         <div class="footer">
           Generated automatically • Only tasks and directives are captured. Banter filtered out.
         </div>
@@ -468,7 +481,7 @@ def generate_email_html(tasks, config, imsg_err=None):
     </body>
     </html>
     """
-    return html
+    return html_content
 
 
 def send_briefing_email(access_token, recipient, subject, html_content):
@@ -544,20 +557,58 @@ def run_briefing(send_email=True, hours=24):
 
 def run_server():
     from http.server import HTTPServer, BaseHTTPRequestHandler
-    import subprocess
+    import ipaddress
     config = load_config()
     port = config.get("server_port", 8765)
     spouse_name = config.get("spouse_name", "Spouse")
 
+    def is_trusted_host(host_header):
+        if not host_header:
+            return True
+        hostname = host_header.split(":")[0].strip()
+        if hostname in ["127.0.0.1", "localhost", "::1"]:
+            return True
+        try:
+            ip = ipaddress.ip_address(hostname)
+            return ip.is_private or ip.is_loopback
+        except ValueError:
+            return False
+
     class TaskHandler(BaseHTTPRequestHandler):
         def do_GET(self):
+            # CSRF & Host validation: Reject cross-origin requests from public websites
+            host = self.headers.get("Host", "")
+            origin = self.headers.get("Origin") or self.headers.get("Referer")
+            if origin:
+                origin_host = urllib.parse.urlparse(origin).netloc
+                if not is_trusted_host(origin_host):
+                    self.send_response(403)
+                    self.end_headers()
+                    self.wfile.write(b"Forbidden: untrusted origin.")
+                    return
+
+            if not is_trusted_host(host):
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b"Bad Request: invalid host header.")
+                return
+
             parsed = urllib.parse.urlparse(self.path)
             if parsed.path == "/start":
                 params = urllib.parse.parse_qs(parsed.query)
-                task = params.get("task", ["Unknown Task"])[0]
-                prompt = f"Please help me complete this task from {spouse_name}: {task}"
+                raw_task = params.get("task", [""])[0]
 
-                # 1. Put prompt into macOS clipboard
+                # Input validation: cap length and strip control characters
+                clean_task = "".join(ch for ch in raw_task[:300] if ch.isprintable() or ch in " \t\n").strip()
+                if not clean_task:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b"Bad Request: missing or invalid task parameter.")
+                    return
+
+                prompt = f"Please help me complete this task from {spouse_name}: {clean_task}"
+
+                # 1. Put prompt into macOS clipboard safely via stdin
                 try:
                     p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
                     p.communicate(prompt.encode("utf-8"))
@@ -566,30 +617,49 @@ def run_server():
 
                 # 2. Activate Antigravity application window
                 try:
-                    subprocess.run(["osascript", "-e", 'tell application "Antigravity" to activate'])
+                    subprocess.run(["osascript", "-e", 'tell application "Antigravity" to activate'], check=False)
                 except Exception as e:
                     print(f"Error activating Antigravity: {e}", file=sys.stderr)
 
-                # 3. Deliver desktop notification
-                clean_task = task.replace('"', '\\"')
-                os.system(f'osascript -e \'display notification "{clean_task}" with title "Antigravity Activated" subtitle "Prompt copied to clipboard"\'')
+                # 3. Deliver desktop notification safely using argv (no shell injection)
+                try:
+                    notify_script = """
+                    on run argv
+                        display notification (item 1 of argv) with title (item 2 of argv) subtitle (item 3 of argv)
+                    end run
+                    """
+                    subprocess.run(["osascript", "-e", notify_script, clean_task, "Antigravity Activated", "Prompt copied to clipboard"], check=False)
+                except Exception as e:
+                    print(f"Error showing notification: {e}", file=sys.stderr)
 
-                # 4. Save to task queue
+                # 4. Save to task queue with restrictive permissions (0600)
                 queue_path = os.path.join(os.path.dirname(__file__), "tasks_queue.json")
                 queue = []
                 if os.path.exists(queue_path):
                     try:
-                        with open(queue_path, "r") as f:
+                        with open(queue_path, "r", encoding="utf-8") as f:
                             queue = json.load(f)
                     except Exception:
                         pass
-                queue.append({"task": task, "timestamp": datetime.now().isoformat()})
-                with open(queue_path, "w") as f:
+                queue.append({"task": clean_task, "timestamp": datetime.now().isoformat()})
+                
+                temp_path = f"{queue_path}.tmp"
+                flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+                fd = os.open(temp_path, flags, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
                     json.dump(queue, f, indent=2)
+                os.replace(temp_path, queue_path)
+
+                escaped_task = html.escape(clean_task)
+                escaped_prompt = html.escape(prompt)
 
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("X-Frame-Options", "DENY")
+                self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';")
                 self.end_headers()
+
                 resp_html = f"""
                 <!DOCTYPE html>
                 <html>
@@ -610,7 +680,7 @@ def run_server():
                   <div class="box">
                     <h1>🚀 Antigravity Activated!</h1>
                     <p style="font-size: 15px;">Your task has been loaded and Antigravity is now open in the foreground.</p>
-                    <div class="prompt-box" id="pbox">{prompt}</div>
+                    <div class="prompt-box" id="pbox">{escaped_prompt}</div>
                     <div>
                       <a href="antigravity://" class="btn">⚡ Switch to Antigravity</a>
                       <button onclick="navigator.clipboard.writeText(document.getElementById('pbox').innerText); alert('Copied!');" class="btn btn-copy">📋 Copy Prompt</button>
