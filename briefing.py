@@ -61,6 +61,22 @@ def save_stored_tasks(tasks, path=ACTIVE_TASKS_FILE):
         json.dump(tasks, f, indent=2)
     os.replace(temp_path, path)
 
+def auto_archive_past_events(tasks):
+    """Automatically marks past scheduled events/games as completed so they don't linger."""
+    today = datetime.now().date()
+    for t in tasks:
+        if t.get("status") == "open" and t.get("type") in ["GO_HERE", "REMEMBER_THIS"]:
+            sched = t.get("schedule", "")
+            m = re.search(r"([A-Za-z]+,\s+[A-Za-z]+\s+\d{1,2},\s+\d{4})", sched)
+            if m:
+                try:
+                    event_date = datetime.strptime(m.group(1), "%A, %b %d, %Y").date()
+                    if event_date < today:
+                        t["status"] = "completed"
+                        t["completed_at"] = datetime.now().isoformat()
+                except Exception:
+                    pass
+
 def update_task_store(new_scanned_tasks, path=ACTIVE_TASKS_FILE):
     """Merges newly detected tasks into the persistent task store without resurrecting completed tasks."""
     stored = load_stored_tasks(path)
@@ -87,10 +103,25 @@ def update_task_store(new_scanned_tasks, path=ACTIVE_TASKS_FILE):
                 "completed_at": None
             })
 
+    # Automatically archive calendar events that occurred in the past
+    auto_archive_past_events(stored)
+
     save_stored_tasks(stored, path)
     return stored
 
 # --- Authentication Helpers ---
+
+def wait_for_network(max_wait_seconds=90, check_interval=5):
+    """Waits for network / DNS resolution to be ready after system wake."""
+    import time
+    start = time.time()
+    while time.time() - start < max_wait_seconds:
+        try:
+            socket.getaddrinfo("oauth2.googleapis.com", 443)
+            return True
+        except (socket.gaierror, OSError):
+            time.sleep(check_interval)
+    return False
 
 def get_gmail_access_token():
     """Refreshes and returns an access token using standard Google OAuth credentials or MCP storage."""
@@ -122,8 +153,17 @@ def get_gmail_access_token():
     }).encode("utf-8")
 
     req = urllib.request.Request("https://oauth2.googleapis.com/token", data=data)
-    with urllib.request.urlopen(req) as resp:
-        return json.loads(resp.read().decode("utf-8"))["access_token"]
+    
+    # Retry up to 3 times in case of intermittent connection on wake
+    import time
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read().decode("utf-8"))["access_token"]
+        except (urllib.error.URLError, socket.gaierror, TimeoutError) as e:
+            if attempt == 2:
+                raise
+            time.sleep(5)
 
 
 # --- Scanners ---
@@ -608,11 +648,17 @@ def send_briefing_email(access_token, recipient, subject, html_content):
 
 def run_briefing(send_email=True, hours=24):
     config = load_config()
+    print(f"[{datetime.now()}] Checking network connectivity...")
+    if not wait_for_network():
+        print(f"[{datetime.now()}] Warning: Network not reachable after waiting. Proceeding with caution.", file=sys.stderr)
     print(f"[{datetime.now()}] Gathering communications for past {hours} hours...")
     access_token = get_gmail_access_token()
     
     emails = fetch_recent_emails(access_token, config["spouse_emails"], hours=hours)
     messages, imsg_err = fetch_recent_messages(config["spouse_phone"], hours=hours)
+    if imsg_err:
+        print(f"[{datetime.now()}] iMessage scan warning: {imsg_err}", file=sys.stderr)
+        print(f"[{datetime.now()}] iMessage scan warning: {imsg_err}")
     
     all_raw = emails + messages
     print(f"Scanning {len(emails)} emails and {len(messages)} texts strictly for tasks...")
